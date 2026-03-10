@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -12,15 +13,19 @@ import (
 	"ehang.io/nps/lib/conn"
 	"ehang.io/nps/lib/crypt"
 	"ehang.io/nps/lib/file"
+	"github.com/astaxie/beego"
 	"github.com/astaxie/beego/logs"
 	"github.com/pkg/errors"
 )
 
 type HttpsServer struct {
 	httpServer
-	listener         net.Listener
-	httpsListenerMap sync.Map
-	hostIdCertMap    sync.Map
+	listener             net.Listener
+	httpsListenerMap     sync.Map
+	hostIdCertMap        sync.Map
+	defaultHttpsOnce     sync.Once
+	defaultHttpsListener *HttpsListener
+	defaultHttpsErr      error
 }
 
 func NewHttpsServer(l net.Listener, bridge NetBridge, useCache bool, cacheLen int) *HttpsServer {
@@ -38,6 +43,11 @@ func (https *HttpsServer) Start() error {
 
 	conn.Accept(https.listener, func(c net.Conn) {
 		serverName, rb := GetServerNameFromClientHello(c)
+		if serverName == "" {
+			if https.handleDefaultCertificate(c, rb) {
+				return
+			}
+		}
 		r := buildHttpsRequest(serverName)
 		if host, err := file.GetDb().GetInfoByHost(serverName, r); err != nil {
 			c.Close()
@@ -138,6 +148,51 @@ func (https *HttpsServer) Start() error {
 	//	})
 	//}
 	return nil
+}
+
+func (https *HttpsServer) getDefaultHttpsListener() (*HttpsListener, error) {
+	https.defaultHttpsOnce.Do(func() {
+		certFile := beego.AppConfig.String("https_default_cert_file")
+		keyFile := beego.AppConfig.String("https_default_key_file")
+		if certFile == "" || keyFile == "" {
+			https.defaultHttpsErr = errors.New("default https certificate is not configured")
+			return
+		}
+		if !common.FileExists(certFile) || !common.FileExists(keyFile) {
+			https.defaultHttpsErr = errors.New("default https certificate file is not exist")
+			return
+		}
+		cert, err := common.ReadAllFromFile(certFile)
+		if err != nil {
+			https.defaultHttpsErr = err
+			return
+		}
+		key, err := common.ReadAllFromFile(keyFile)
+		if err != nil {
+			https.defaultHttpsErr = err
+			return
+		}
+		l := NewHttpsListener(https.listener)
+		https.NewHttps(l, string(cert), string(key))
+		https.defaultHttpsListener = l
+		https.httpsListenerMap.Store("default", l)
+	})
+	if https.defaultHttpsErr != nil {
+		return nil, https.defaultHttpsErr
+	}
+	return https.defaultHttpsListener, nil
+}
+
+func (https *HttpsServer) handleDefaultCertificate(c net.Conn, rb []byte) bool {
+	l, err := https.getDefaultHttpsListener()
+	if err != nil {
+		logs.Warn("load default https certificate error: %v", err)
+		return false
+	}
+	acceptConn := conn.NewConn(c)
+	acceptConn.Rb = rb
+	l.acceptConn <- acceptConn
+	return true
 }
 
 func (https *HttpsServer) cert(host *file.Host, c net.Conn, rb []byte, certFileUrl string, keyFileUrl string) {
@@ -300,21 +355,32 @@ func (httpsListener *HttpsListener) Addr() net.Addr {
 	return httpsListener.parentListener.Addr()
 }
 
-// get server name from connection by read client hello bytes
+// get server name from connection by read full client hello bytes
 func GetServerNameFromClientHello(c net.Conn) (string, []byte) {
-	buf := make([]byte, 4096)
-	data := make([]byte, 4096)
-	n, err := c.Read(buf)
-	if err != nil {
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(c, header); err != nil {
 		return "", nil
 	}
-	if n < 42 {
-		return "", nil
+	if header[0] != 0x16 {
+		return "", header
 	}
-	copy(data, buf[:n])
+	recordLen := int(header[3])<<8 | int(header[4])
+	if recordLen <= 0 {
+		return "", header
+	}
+	body := make([]byte, recordLen)
+	if _, err := io.ReadFull(c, body); err != nil {
+		return "", append(header, body...)
+	}
+	rb := append(header, body...)
+	if len(body) < 42 {
+		return "", rb
+	}
 	clientHello := new(crypt.ClientHelloMsg)
-	clientHello.Unmarshal(data[5:n])
-	return clientHello.GetServerName(), buf[:n]
+	if !clientHello.Unmarshal(body) {
+		return "", rb
+	}
+	return clientHello.GetServerName(), rb
 }
 
 // build https request
